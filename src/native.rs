@@ -1,5 +1,5 @@
 use crate::{
-    config::{self, Settings},
+    config::{self, Profile, Settings},
     monitor::{MonitorEvent, Worker},
 };
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -18,6 +18,14 @@ use windows_sys::Win32::{
 
 const ID_PREFIX: i32 = 100;
 const ID_AUTO: i32 = 101;
+const ID_PROFILE_TABS: i32 = 102;
+const ID_PROFILE_NAME: i32 = 103;
+const ID_PROFILE_RENAME: i32 = 104;
+const ID_PROFILE_NEW: i32 = 105;
+const ID_PROFILE_DELETE: i32 = 106;
+const ID_HP_MAX: i32 = 150;
+const ID_HP_DAMAGE: i32 = 151;
+const ID_HP_SAFE: i32 = 152;
 const ID_HP_BASE: i32 = 110;
 const ID_MP_BASE: i32 = 120;
 const ID_START_HP: i32 = 130;
@@ -40,6 +48,7 @@ const WS_CHILD_VISIBLE: u32 = WS_CHILD | WS_VISIBLE;
 
 struct AppState {
     hwnd: HWND,
+    font: HFONT,
     controls: HashMap<i32, HWND>,
     settings: Settings,
     config_valid: bool,
@@ -78,8 +87,10 @@ impl Drop for ReentrantGuard {
 }
 
 pub fn run() -> Result<(), String> {
+    add_tesseract_to_path();
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        InitCommonControls();
     }
     let path = config::settings_path().map_err(|e| e.to_string())?;
     let loaded = config::load(&path);
@@ -90,6 +101,7 @@ pub fn run() -> Result<(), String> {
     let (tx, rx) = unbounded();
     let mut app = Box::new(AppState {
         hwnd: ptr::null_mut(),
+        font: ptr::null_mut(),
         controls: HashMap::new(),
         settings,
         config_valid,
@@ -125,7 +137,7 @@ pub fn run() -> Result<(), String> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             900,
-            680,
+            710,
             ptr::null_mut(),
             ptr::null_mut(),
             instance,
@@ -136,7 +148,28 @@ pub fn run() -> Result<(), String> {
             return Err("無法建立主視窗".into());
         }
         app.hwnd = hwnd;
+        let face = wide("Microsoft JhengHei");
+        app.font = CreateFontW(
+            -15,
+            0,
+            0,
+            0,
+            FW_NORMAL as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            CLEARTYPE_QUALITY as u32,
+            (DEFAULT_PITCH | FF_DONTCARE) as u32,
+            face.as_ptr(),
+        );
         create_controls(&mut app);
+        refresh_profile_tabs(&app, app.settings.active_profile);
+        if !app.font.is_null() {
+            EnumChildWindows(app.hwnd, Some(apply_child_font), app.font as LPARAM);
+        }
         load_controls(&app);
         app.loading_controls = false;
         let failed = [(HOTKEY_ALL, VK_F5), (HOTKEY_HP, VK_F6), (HOTKEY_MP, VK_F7)]
@@ -171,6 +204,22 @@ pub fn run() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn add_tesseract_to_path() {
+    const TESSERACT_DIR: &str = r"C:\Program Files\Tesseract-OCR";
+    let mut paths =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
+    if paths
+        .iter()
+        .any(|path| path.to_string_lossy().eq_ignore_ascii_case(TESSERACT_DIR))
+    {
+        return;
+    }
+    paths.push(TESSERACT_DIR.into());
+    if let Ok(path) = std::env::join_paths(paths) {
+        std::env::set_var("PATH", path);
+    }
 }
 
 pub fn report_startup_error(message: &str) {
@@ -213,6 +262,14 @@ unsafe extern "system" fn wnd_proc(
                 return 0;
             }
             match id {
+                ID_PROFILE_RENAME => rename_active_profile(app),
+                ID_PROFILE_NEW => add_profile(app),
+                ID_PROFILE_DELETE => delete_active_profile(app),
+                ID_HP_MAX | ID_HP_DAMAGE => {
+                    if !app.loading_controls {
+                        update_hp_safety_threshold(app);
+                    }
+                }
                 ID_SAVE => {
                     let _ = save_from_controls(app, true, true);
                 }
@@ -243,6 +300,31 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
                 _ => {}
+            }
+            0
+        }
+        WM_NOTIFY if lparam != 0 => {
+            let notification = &*(lparam as *const NMHDR);
+            if notification.idFrom == ID_PROFILE_TABS as usize {
+                match notification.code {
+                    TCN_SELCHANGING => {
+                        if app.workers.iter().any(Option::is_some) {
+                            set_error(app, "監控執行中，請先停止 HP／MP 才能切換設定檔。");
+                            return 1;
+                        }
+                        if app.capturing_key.is_some() || !save_from_controls(app, false, false) {
+                            return 1;
+                        }
+                    }
+                    TCN_SELCHANGE => {
+                        let selected =
+                            SendMessageW(app.controls[&ID_PROFILE_TABS], TCM_GETCURSEL, 0, 0);
+                        if selected >= 0 {
+                            activate_profile(app, selected as usize);
+                        }
+                    }
+                    _ => {}
+                }
             }
             0
         }
@@ -288,8 +370,20 @@ unsafe extern "system" fn wnd_proc(
             PostQuitMessage(0);
             0
         }
+        WM_NCDESTROY => {
+            if !app.font.is_null() {
+                DeleteObject(app.font as HGDIOBJ);
+                app.font = ptr::null_mut();
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+unsafe extern "system" fn apply_child_font(hwnd: HWND, font: LPARAM) -> i32 {
+    SendMessageW(hwnd, WM_SETFONT, font as usize, 1);
+    1
 }
 
 unsafe fn create_controls(app: &mut AppState) {
@@ -332,16 +426,90 @@ unsafe fn create_controls(app: &mut AppState) {
             ID_AUTO,
         ),
     );
-    let auto = if app.settings.ocr.auto_region {
+    app.controls.insert(
+        ID_PROFILE_TABS,
+        control(
+            app.hwnd,
+            "SysTabControl32",
+            "",
+            WS_CHILD_VISIBLE | WS_TABSTOP | TCS_TABS,
+            20,
+            45,
+            425,
+            30,
+            ID_PROFILE_TABS,
+        ),
+    );
+    app.controls.insert(
+        ID_PROFILE_NAME,
+        control(
+            app.hwnd,
+            "EDIT",
+            "",
+            WS_CHILD_VISIBLE | WS_BORDER | ES_AUTOHSCROLL as u32,
+            493,
+            48,
+            128,
+            24,
+            ID_PROFILE_NAME,
+        ),
+    );
+    app.controls.insert(
+        ID_PROFILE_RENAME,
+        control(
+            app.hwnd,
+            "BUTTON",
+            "更名",
+            WS_CHILD_VISIBLE | WS_TABSTOP,
+            626,
+            45,
+            64,
+            28,
+            ID_PROFILE_RENAME,
+        ),
+    );
+    app.controls.insert(
+        ID_PROFILE_NEW,
+        control(
+            app.hwnd,
+            "BUTTON",
+            "新增",
+            WS_CHILD_VISIBLE | WS_TABSTOP,
+            695,
+            45,
+            64,
+            28,
+            ID_PROFILE_NEW,
+        ),
+    );
+    app.controls.insert(
+        ID_PROFILE_DELETE,
+        control(
+            app.hwnd,
+            "BUTTON",
+            "刪除",
+            WS_CHILD_VISIBLE | WS_TABSTOP,
+            764,
+            45,
+            64,
+            28,
+            ID_PROFILE_DELETE,
+        ),
+    );
+    label(app.hwnd, "名稱", 455, 51);
+    let auto = if app.settings.profiles[app.settings.active_profile]
+        .ocr
+        .auto_region
+    {
         BST_CHECKED
     } else {
         BST_UNCHECKED
     };
     SendMessageW(app.controls[&ID_AUTO], BM_SETCHECK, auto as usize, 0);
-    group(app.hwnd, "HP 補血", 20, 55, 410, 425);
-    group(app.hwnd, "MP 補魔", 450, 55, 410, 425);
+    group(app.hwnd, "HP 補血", 20, 82, 410, 440);
+    group(app.hwnd, "MP 補魔", 450, 82, 410, 440);
     for (base, x, mana) in [(ID_HP_BASE, 40, false), (ID_MP_BASE, 470, true)] {
-        label(app.hwnd, "低於門檻時補水 (%)", x, 88);
+        label(app.hwnd, "低於門檻時補水 (%)", x, 115);
         app.controls.insert(
             base,
             control(
@@ -350,13 +518,52 @@ unsafe fn create_controls(app: &mut AppState) {
                 "",
                 WS_CHILD_VISIBLE | WS_BORDER | ES_AUTOHSCROLL as u32,
                 x + 170,
-                84,
+                111,
                 90,
                 24,
                 base,
             ),
         );
-        label(app.hwnd, "補水按鍵", x, 123);
+        let (key_label_y, key_input_y, region_label_y, region_input_y, pick_y) = if mana {
+            (150, 146, 185, 212, 244)
+        } else {
+            for (id, title, y) in [
+                (ID_HP_MAX, "角色 HP 上限", 150),
+                (ID_HP_DAMAGE, "怪物最大傷害", 185),
+            ] {
+                label(app.hwnd, title, x, y);
+                app.controls.insert(
+                    id,
+                    control(
+                        app.hwnd,
+                        "EDIT",
+                        "0",
+                        WS_CHILD_VISIBLE | WS_BORDER | ES_AUTOHSCROLL as u32,
+                        x + 170,
+                        y - 4,
+                        100,
+                        24,
+                        id,
+                    ),
+                );
+            }
+            app.controls.insert(
+                ID_HP_SAFE,
+                control(
+                    app.hwnd,
+                    "STATIC",
+                    "建議門檻：請輸入 HP 與傷害",
+                    WS_CHILD_VISIBLE,
+                    x + 4,
+                    213,
+                    360,
+                    22,
+                    ID_HP_SAFE,
+                ),
+            );
+            (242, 238, 277, 304, 336)
+        };
+        label(app.hwnd, "補水按鍵", x, key_label_y);
         app.controls.insert(
             base + 2,
             control(
@@ -365,13 +572,13 @@ unsafe fn create_controls(app: &mut AppState) {
                 "",
                 WS_CHILD_VISIBLE | WS_TABSTOP,
                 x + 170,
-                119,
+                key_input_y,
                 120,
                 24,
                 base + 2,
             ),
         );
-        label(app.hwnd, "手動區域 [左, 上, 右, 下]", x, 158);
+        label(app.hwnd, "手動區域 [左, 上, 右, 下]", x, region_label_y);
         for j in 0..4 {
             app.controls.insert(
                 base + 4 + j,
@@ -381,7 +588,7 @@ unsafe fn create_controls(app: &mut AppState) {
                     "",
                     WS_CHILD_VISIBLE | WS_BORDER | ES_AUTOHSCROLL as u32,
                     x + 4 + (j as i32) * 78,
-                    185,
+                    region_input_y,
                     70,
                     24,
                     base + 4 + j,
@@ -397,7 +604,7 @@ unsafe fn create_controls(app: &mut AppState) {
                 "拖曳選取區域",
                 WS_CHILD_VISIBLE | WS_TABSTOP,
                 x + 4,
-                217,
+                pick_y,
                 145,
                 28,
                 pick_id,
@@ -413,7 +620,7 @@ unsafe fn create_controls(app: &mut AppState) {
             "尚未啟動",
             WS_CHILD_VISIBLE,
             40,
-            330,
+            390,
             370,
             55,
             ID_HP_STATUS,
@@ -427,7 +634,7 @@ unsafe fn create_controls(app: &mut AppState) {
             "OCR：—",
             WS_CHILD_VISIBLE,
             40,
-            390,
+            450,
             370,
             60,
             ID_HP_SCAN,
@@ -441,7 +648,7 @@ unsafe fn create_controls(app: &mut AppState) {
             "尚未啟動",
             WS_CHILD_VISIBLE,
             470,
-            330,
+            390,
             370,
             55,
             ID_MP_STATUS,
@@ -455,7 +662,7 @@ unsafe fn create_controls(app: &mut AppState) {
             "OCR：—",
             WS_CHILD_VISIBLE,
             470,
-            390,
+            450,
             370,
             60,
             ID_MP_SCAN,
@@ -469,7 +676,7 @@ unsafe fn create_controls(app: &mut AppState) {
             "F6 啟動 HP",
             WS_CHILD_VISIBLE | WS_TABSTOP,
             20,
-            505,
+            532,
             170,
             38,
             ID_START_HP,
@@ -483,7 +690,7 @@ unsafe fn create_controls(app: &mut AppState) {
             "F7 啟動 MP",
             WS_CHILD_VISIBLE | WS_TABSTOP,
             200,
-            505,
+            532,
             170,
             38,
             ID_START_MP,
@@ -497,7 +704,7 @@ unsafe fn create_controls(app: &mut AppState) {
             "F5 啟動全部",
             WS_CHILD_VISIBLE | WS_TABSTOP,
             380,
-            505,
+            532,
             190,
             38,
             ID_START_ALL,
@@ -511,7 +718,7 @@ unsafe fn create_controls(app: &mut AppState) {
             "匯入 JSON",
             WS_CHILD_VISIBLE | WS_TABSTOP,
             580,
-            505,
+            532,
             90,
             38,
             ID_IMPORT,
@@ -525,7 +732,7 @@ unsafe fn create_controls(app: &mut AppState) {
             "匯出 JSON",
             WS_CHILD_VISIBLE | WS_TABSTOP,
             680,
-            505,
+            532,
             90,
             38,
             ID_EXPORT,
@@ -539,7 +746,7 @@ unsafe fn create_controls(app: &mut AppState) {
             "儲存設定",
             WS_CHILD_VISIBLE | WS_TABSTOP,
             780,
-            505,
+            532,
             90,
             38,
             ID_SAVE,
@@ -551,7 +758,7 @@ unsafe fn create_controls(app: &mut AppState) {
         "設定儲存於程式旁的 usersetting.json；Tesseract OCR 需安裝並可由 PATH 找到。",
         WS_CHILD_VISIBLE,
         25,
-        560,
+        587,
         840,
         60,
         0,
@@ -565,21 +772,45 @@ fn key_name(vk: u32) -> Option<String> {
     if (0x70..=0x7b).contains(&vk) {
         return Some(format!("F{}", vk - 0x70 + 1));
     }
-    Some(match vk {
-        0x10 => "Shift", 0x11 => "Ctrl", 0x12 => "Alt",
-        0x2e => "Delete", 0x23 => "End", 0x24 => "Home", 0x2d => "Insert",
-        0x21 => "PageUp", 0x22 => "PageDown", 0x20 => "Space", 0x0d => "Enter",
-        0x09 => "Tab", 0x1b => "Esc", 0x26 => "Up", 0x28 => "Down",
-        0x25 => "Left", 0x27 => "Right", 0x08 => "Backspace",
-        0xbd => "-", 0xbb => "=", 0xdb => "[", 0xdd => "]", 0xba => ";",
-        0xde => "'", 0xbc => ",", 0xbe => ".", 0xbf => "/",
-        _ => return None,
-    }.to_string())
+    Some(
+        match vk {
+            0x10 => "Shift",
+            0x11 => "Ctrl",
+            0x12 => "Alt",
+            0x2e => "Delete",
+            0x23 => "End",
+            0x24 => "Home",
+            0x2d => "Insert",
+            0x21 => "PageUp",
+            0x22 => "PageDown",
+            0x20 => "Space",
+            0x0d => "Enter",
+            0x09 => "Tab",
+            0x1b => "Esc",
+            0x26 => "Up",
+            0x28 => "Down",
+            0x25 => "Left",
+            0x27 => "Right",
+            0x08 => "Backspace",
+            0xbd => "-",
+            0xbb => "=",
+            0xdb => "[",
+            0xdd => "]",
+            0xba => ";",
+            0xde => "'",
+            0xbc => ",",
+            0xbe => ".",
+            0xbf => "/",
+            _ => return None,
+        }
+        .to_string(),
+    )
 }
 
 unsafe fn load_controls(app: &AppState) {
     let _guard = ReentrantGuard::new();
-    let s = &app.settings.ocr;
+    let profile = &app.settings.profiles[app.settings.active_profile];
+    let s = &profile.ocr;
     SendMessageW(
         app.controls[&ID_AUTO],
         BM_SETCHECK,
@@ -591,8 +822,11 @@ unsafe fn load_controls(app: &AppState) {
         0,
     );
     for (id, value) in [
-        (ID_PREFIX, s.pref_var.clone()),
+        (ID_PREFIX, app.settings.window_prefix.clone()),
+        (ID_PROFILE_NAME, profile.name.clone()),
         (ID_HP_BASE, s.th_var.to_string()),
+        (ID_HP_MAX, s.hp_max.to_string()),
+        (ID_HP_DAMAGE, s.monster_max_damage.to_string()),
         (ID_HP_BASE + 2, s.key_var.clone()),
         (ID_MP_BASE, s.mana_th_var.to_string()),
         (ID_MP_BASE + 2, s.mana_key_var.clone()),
@@ -604,6 +838,7 @@ unsafe fn load_controls(app: &AppState) {
             set_text(app.controls[&(base + 4 + j as i32)], &value.to_string());
         }
     }
+    update_hp_suggestion_label(app, s.hp_max, s.monster_max_damage);
 }
 
 unsafe fn save_from_controls(
@@ -611,8 +846,25 @@ unsafe fn save_from_controls(
     show: bool,
     allow_invalid_replacement: bool,
 ) -> bool {
-    let mut s = app.settings.ocr.clone();
-    s.pref_var = get_text(app.controls[&ID_PREFIX]);
+    let active_profile = app.settings.active_profile;
+    let mut s = app.settings.profiles[active_profile].ocr.clone();
+    let window_prefix = get_text(app.controls[&ID_PREFIX]);
+    let hp_max = get_text(app.controls[&ID_HP_MAX]).parse::<i32>();
+    let monster_max_damage = get_text(app.controls[&ID_HP_DAMAGE]).parse::<i32>();
+    let (Ok(hp_max), Ok(monster_max_damage)) = (hp_max, monster_max_damage) else {
+        if show {
+            set_error(app, "角色 HP 上限與怪物最大傷害必須是整數。");
+        }
+        return false;
+    };
+    if hp_max < 0 || monster_max_damage < 0 {
+        if show {
+            set_error(app, "角色 HP 上限與怪物最大傷害不可為負數。");
+        }
+        return false;
+    }
+    s.hp_max = hp_max;
+    s.monster_max_damage = monster_max_damage;
     s.auto_region = SendMessageW(app.controls[&ID_AUTO], BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
     let values = [(ID_HP_BASE, false), (ID_MP_BASE, true)];
     for (base, mana) in values {
@@ -655,7 +907,8 @@ unsafe fn save_from_controls(
             }
         }
     }
-    app.settings.ocr = s;
+    app.settings.window_prefix = window_prefix;
+    app.settings.profiles[active_profile].ocr = s;
     if !app.config_valid && !allow_invalid_replacement {
         return true;
     }
@@ -673,6 +926,45 @@ unsafe fn save_from_controls(
     }
 }
 
+unsafe fn update_hp_safety_threshold(app: &mut AppState) {
+    let hp_max = get_text(app.controls[&ID_HP_MAX]).parse::<i32>();
+    let max_damage = get_text(app.controls[&ID_HP_DAMAGE]).parse::<i32>();
+    let (Ok(hp_max), Ok(max_damage)) = (hp_max, max_damage) else {
+        set_text(app.controls[&ID_HP_SAFE], "建議門檻：請輸入有效整數");
+        return;
+    };
+    if hp_max <= 0 || max_damage <= 0 {
+        set_text(app.controls[&ID_HP_SAFE], "建議門檻：HP 與傷害都需大於 0");
+        return;
+    }
+    let threshold = (((max_damage as f64 / hp_max as f64) * 1000.0).ceil() / 10.0).min(100.0);
+    {
+        let _guard = ReentrantGuard::new();
+        set_text(app.controls[&ID_HP_BASE], &format!("{threshold:.1}"));
+    }
+    update_hp_suggestion_label(app, hp_max, max_damage);
+    let _ = save_from_controls(app, false, false);
+}
+
+unsafe fn update_hp_suggestion_label(app: &AppState, hp_max: i32, max_damage: i32) {
+    if hp_max <= 0 || max_damage <= 0 {
+        set_text(app.controls[&ID_HP_SAFE], "建議門檻：HP 與傷害都需大於 0");
+        return;
+    }
+    let threshold = (((max_damage as f64 / hp_max as f64) * 1000.0).ceil() / 10.0).min(100.0);
+    if max_damage >= hp_max {
+        set_text(
+            app.controls[&ID_HP_SAFE],
+            &format!("建議門檻：{threshold:.1}%（最大傷害可能秒殺）"),
+        );
+    } else {
+        set_text(
+            app.controls[&ID_HP_SAFE],
+            &format!("建議門檻：{threshold:.1}%"),
+        );
+    }
+}
+
 unsafe fn toggle_worker(app: &mut AppState, mana: bool) {
     let index = usize::from(mana);
     if let Some(mut worker) = app.workers[index].take() {
@@ -685,13 +977,15 @@ unsafe fn toggle_worker(app: &mut AppState, mana: bool) {
     if !save_from_controls(app, true, false) {
         return;
     }
-    if let Err(error) = app.settings.ocr.validate(mana) {
+    let ocr = &app.settings.profiles[app.settings.active_profile].ocr;
+    if let Err(error) = ocr.validate(mana) {
         set_error(app, &error);
         return;
     }
     app.workers[index] = Some(Worker::start(
         mana,
-        app.settings.ocr.clone(),
+        ocr.clone(),
+        app.settings.window_prefix.clone(),
         app.tx.clone(),
     ));
     let status = if mana { ID_MP_STATUS } else { ID_HP_STATUS };
@@ -715,19 +1009,28 @@ unsafe fn start_all(app: &mut AppState) {
         return;
     }
     for mana in [false, true] {
-        if let Err(error) = app.settings.ocr.validate(mana) {
+        if let Err(error) = app.settings.profiles[app.settings.active_profile]
+            .ocr
+            .validate(mana)
+        {
             set_error(app, &error);
             return;
         }
     }
     app.workers[0] = Some(Worker::start(
         false,
-        app.settings.ocr.clone(),
+        app.settings.profiles[app.settings.active_profile]
+            .ocr
+            .clone(),
+        app.settings.window_prefix.clone(),
         app.tx.clone(),
     ));
     app.workers[1] = Some(Worker::start(
         true,
-        app.settings.ocr.clone(),
+        app.settings.profiles[app.settings.active_profile]
+            .ocr
+            .clone(),
+        app.settings.window_prefix.clone(),
         app.tx.clone(),
     ));
     set_text(app.controls[&ID_HP_STATUS], "啟動中…");
@@ -740,16 +1043,216 @@ unsafe fn update_worker_buttons(app: &AppState) {
     let mp_running = app.workers[1].is_some();
     set_text(
         app.controls[&ID_START_HP],
-        if hp_running { "F6 停止 HP（執行中）" } else { "F6 啟動 HP" },
+        if hp_running {
+            "F6 停止 HP（執行中）"
+        } else {
+            "F6 啟動 HP"
+        },
     );
     set_text(
         app.controls[&ID_START_MP],
-        if mp_running { "F7 停止 MP（執行中）" } else { "F7 啟動 MP" },
+        if mp_running {
+            "F7 停止 MP（執行中）"
+        } else {
+            "F7 啟動 MP"
+        },
     );
     set_text(
         app.controls[&ID_START_ALL],
-        if hp_running || mp_running { "F5 停止全部" } else { "F5 啟動全部" },
+        if hp_running || mp_running {
+            "F5 停止全部"
+        } else {
+            "F5 啟動全部"
+        },
     );
+}
+
+unsafe fn refresh_profile_tabs(app: &AppState, selected: usize) {
+    let tabs = app.controls[&ID_PROFILE_TABS];
+    let count = SendMessageW(tabs, TCM_GETITEMCOUNT, 0, 0).max(0);
+    for _ in 0..count {
+        SendMessageW(tabs, TCM_DELETEITEM, 0, 0);
+    }
+    for (index, profile) in app.settings.profiles.iter().enumerate() {
+        let mut title = wide(&profile.name);
+        let mut item: TCITEMW = std::mem::zeroed();
+        item.mask = TCIF_TEXT;
+        item.pszText = title.as_mut_ptr();
+        item.cchTextMax = title.len() as i32;
+        SendMessageW(
+            tabs,
+            TCM_INSERTITEMW,
+            index,
+            &item as *const TCITEMW as LPARAM,
+        );
+    }
+    if !app.settings.profiles.is_empty() {
+        SendMessageW(
+            tabs,
+            TCM_SETCURSEL,
+            selected.min(app.settings.profiles.len() - 1),
+            0,
+        );
+    }
+}
+
+unsafe fn activate_profile(app: &mut AppState, index: usize) {
+    if index >= app.settings.profiles.len() || index == app.settings.active_profile {
+        return;
+    }
+    app.settings.active_profile = index;
+    app.loading_controls = true;
+    load_controls(app);
+    app.loading_controls = false;
+    if app.config_valid {
+        if let Err(error) = config::save(&app.path, &app.settings) {
+            set_error(app, &format!("目前設定檔已切換，但索引儲存失敗：{error}"));
+            return;
+        }
+    }
+    set_text(
+        app.controls[&ID_HP_STATUS],
+        &format!("已切換設定檔：{}", app.settings.profiles[index].name),
+    );
+}
+
+unsafe fn profile_changes_allowed(app: &AppState) -> bool {
+    if app.workers.iter().any(Option::is_some) {
+        set_error(app, "監控執行中，請先停止 HP／MP 再管理設定檔。");
+        false
+    } else {
+        true
+    }
+}
+
+unsafe fn rename_active_profile(app: &mut AppState) {
+    if !profile_changes_allowed(app) || !save_from_controls(app, false, false) {
+        return;
+    }
+    let name = get_text(app.controls[&ID_PROFILE_NAME]).trim().to_owned();
+    if name.is_empty() {
+        set_error(app, "設定檔名稱不可空白。");
+        return;
+    }
+    if app
+        .settings
+        .profiles
+        .iter()
+        .enumerate()
+        .any(|(index, profile)| {
+            index != app.settings.active_profile && profile.name.eq_ignore_ascii_case(&name)
+        })
+    {
+        set_error(app, "設定檔名稱不可重複。");
+        return;
+    }
+    let index = app.settings.active_profile;
+    let previous = app.settings.profiles[index].name.clone();
+    app.settings.profiles[index].name = name;
+    match config::save(&app.path, &app.settings) {
+        Ok(()) => {
+            app.config_valid = true;
+            refresh_profile_tabs(app, index);
+            load_controls(app);
+            set_text(app.controls[&ID_HP_STATUS], "設定檔名稱已更新。");
+        }
+        Err(error) => {
+            app.settings.profiles[index].name = previous;
+            load_controls(app);
+            set_error(app, &format!("設定檔名稱儲存失敗：{error}"));
+        }
+    }
+}
+
+unsafe fn add_profile(app: &mut AppState) {
+    if !profile_changes_allowed(app) || !save_from_controls(app, false, false) {
+        return;
+    }
+    let mut number = app.settings.profiles.len() + 1;
+    let name = loop {
+        let candidate = format!("角色 {number}");
+        if app
+            .settings
+            .profiles
+            .iter()
+            .all(|profile| profile.name != candidate)
+        {
+            break candidate;
+        }
+        number += 1;
+    };
+    let source = app.settings.profiles[app.settings.active_profile]
+        .ocr
+        .clone();
+    app.settings.profiles.push(Profile { name, ocr: source });
+    app.settings.active_profile = app.settings.profiles.len() - 1;
+    match config::save(&app.path, &app.settings) {
+        Ok(()) => {
+            app.config_valid = true;
+            refresh_profile_tabs(app, app.settings.active_profile);
+            app.loading_controls = true;
+            load_controls(app);
+            app.loading_controls = false;
+            set_text(
+                app.controls[&ID_HP_STATUS],
+                "已新增設定檔，可修改名稱與角色設定。",
+            );
+        }
+        Err(error) => {
+            app.settings.profiles.pop();
+            app.settings.active_profile = app.settings.profiles.len() - 1;
+            refresh_profile_tabs(app, app.settings.active_profile);
+            load_controls(app);
+            set_error(app, &format!("新增設定檔儲存失敗：{error}"));
+        }
+    }
+}
+
+unsafe fn delete_active_profile(app: &mut AppState) {
+    if !profile_changes_allowed(app) || !save_from_controls(app, false, false) {
+        return;
+    }
+    if app.settings.profiles.len() <= 1 {
+        set_error(app, "至少要保留一個設定檔。");
+        return;
+    }
+    let name = &app.settings.profiles[app.settings.active_profile].name;
+    let prompt = wide(&format!("確定刪除設定檔「{name}」？此操作無法復原。"));
+    let title = wide("刪除設定檔");
+    let confirmed = {
+        let _guard = ReentrantGuard::new();
+        MessageBoxW(
+            app.hwnd,
+            prompt.as_ptr(),
+            title.as_ptr(),
+            MB_YESNO | MB_ICONWARNING,
+        ) == IDYES
+    };
+    if !confirmed {
+        return;
+    }
+    let previous = app.settings.clone();
+    app.settings.profiles.remove(app.settings.active_profile);
+    app.settings.active_profile = app
+        .settings
+        .active_profile
+        .min(app.settings.profiles.len() - 1);
+    match config::save(&app.path, &app.settings) {
+        Ok(()) => {
+            app.config_valid = true;
+            refresh_profile_tabs(app, app.settings.active_profile);
+            app.loading_controls = true;
+            load_controls(app);
+            app.loading_controls = false;
+            set_text(app.controls[&ID_HP_STATUS], "設定檔已刪除。");
+        }
+        Err(error) => {
+            app.settings = previous;
+            refresh_profile_tabs(app, app.settings.active_profile);
+            load_controls(app);
+            set_error(app, &format!("刪除設定檔儲存失敗：{error}"));
+        }
+    }
 }
 unsafe fn send_command(app: &AppState, id: i32) {
     let _ = PostMessageW(app.hwnd, WM_COMMAND, id as usize, 0);
@@ -887,6 +1390,9 @@ unsafe fn export_settings(app: &mut AppState) {
 }
 
 unsafe fn import_settings(app: &mut AppState) {
+    if !profile_changes_allowed(app) {
+        return;
+    }
     let Some(path) = choose_json_path(app.hwnd, false) else {
         return;
     };
@@ -902,6 +1408,7 @@ unsafe fn import_settings(app: &mut AppState) {
             app.settings = imported;
             app.config_valid = true;
             app.loading_controls = true;
+            refresh_profile_tabs(app, app.settings.active_profile);
             load_controls(app);
             app.loading_controls = false;
             set_text(app.controls[&ID_HP_STATUS], "設定已匯入並儲存。");

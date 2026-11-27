@@ -3,6 +3,7 @@ use crate::{
     ocr::{self, Decision, HealDecision},
 };
 use crossbeam_channel::Sender;
+use std::os::windows::process::CommandExt;
 use std::{
     io::Write,
     process::{Command, Stdio},
@@ -48,10 +49,16 @@ pub struct Worker {
     join: Option<JoinHandle<()>>,
 }
 impl Worker {
-    pub fn start(mana: bool, settings: OcrSettings, events: Sender<MonitorEvent>) -> Self {
+    pub fn start(
+        mana: bool,
+        settings: OcrSettings,
+        window_prefix: String,
+        events: Sender<MonitorEvent>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
-        let join = thread::spawn(move || monitor_loop(mana, settings, events, thread_stop));
+        let join =
+            thread::spawn(move || monitor_loop(mana, settings, window_prefix, events, thread_stop));
         Self {
             stop,
             join: Some(join),
@@ -73,6 +80,7 @@ impl Drop for Worker {
 fn monitor_loop(
     mana: bool,
     settings: OcrSettings,
+    window_prefix: String,
     events: Sender<MonitorEvent>,
     stop: Arc<AtomicBool>,
 ) {
@@ -84,16 +92,12 @@ fn monitor_loop(
             settings.mana_region,
         )
     } else {
-        (
-            settings.th_var,
-            settings.key_var.clone(),
-            settings.region,
-        )
+        (settings.th_var, settings.key_var.clone(), settings.region)
     };
     let mut decision = HealDecision::default();
     let mut auto_cache: Option<(RECT, [i32; 4])> = None;
     while !stop.load(Ordering::Acquire) {
-        let Some((hwnd, bounds, title)) = find_game_window(&settings.pref_var) else {
+        let Some((hwnd, bounds, title)) = find_game_window(&window_prefix) else {
             let _ = events.send(MonitorEvent {
                 mana,
                 text: "找不到符合標題前綴的遊戲視窗".into(),
@@ -156,19 +160,33 @@ fn monitor_loop(
             }
         };
         let mut raw = String::new();
-        let mut reading = None;
-        let candidates = [process_bmp(&bmp, false), process_bmp(&bmp, true)];
-        for (candidate, psm) in [
-            (&candidates[0], 7),
-            (&candidates[1], 7),
-            (&candidates[0], 6),
+        let mut readings = Vec::new();
+        let mut needs_consensus = false;
+        for (threshold, psm, scale) in [
+            (None, 7, 3),
+            (Some(150), 7, 4),
+            (Some(125), 7, 4),
+            (Some(175), 7, 4),
+            (None, 6, 4),
         ] {
-            match tesseract(candidate, psm, false) {
+            let candidate = process_bmp(&bmp, threshold, scale);
+            match tesseract(&candidate, psm, false) {
                 Ok(text) => {
                     raw = text.trim().to_owned();
-                    reading = ocr::parse_reading(&raw);
-                    if reading.is_some() {
-                        break;
+                    if let Some(reading) = ocr::parse_reading(&raw) {
+                        readings.push((reading, raw.clone()));
+                        let votes = readings.iter().filter(|(seen, _)| *seen == reading).count();
+                        // Retry only when the maximum looks like it gained a
+                        // leading OCR digit, rather than for every low HP value.
+                        let current = reading.current.to_string();
+                        let maximum = reading.maximum.to_string();
+                        let suspicious = reading.maximum >= reading.current.saturating_mul(5)
+                            && maximum.len() == current.len() + 1
+                            && maximum.ends_with(&current);
+                        needs_consensus |= suspicious;
+                        if (!needs_consensus && !suspicious) || votes >= 3 {
+                            break;
+                        }
                     }
                 }
                 Err(error) => {
@@ -177,13 +195,33 @@ fn monitor_loop(
                 }
             }
         }
+        let selected = readings
+            .iter()
+            .max_by_key(|(reading, _)| readings.iter().filter(|(seen, _)| seen == reading).count());
+        let reading = selected.and_then(|(reading, text)| {
+            let votes = readings.iter().filter(|(seen, _)| seen == reading).count();
+            if needs_consensus && votes < 3 {
+                raw = format!(
+                    "辨識結果不一致：{}",
+                    readings
+                        .iter()
+                        .map(|(value, _)| format!("{}/{}", value.current, value.maximum))
+                        .collect::<Vec<_>>()
+                        .join("、")
+                );
+                None
+            } else {
+                raw = text.clone();
+                Some(*reading)
+            }
+        });
         let Some(reading) = reading else {
             let _ = events.send(MonitorEvent {
                 mana,
                 text: format!("{title} | 無法解析數值"),
                 scan: Some(raw),
             });
-            sleep_interruptible(&stop, Duration::from_millis(120));
+            sleep_interruptible(&stop, Duration::from_millis(80));
             continue;
         };
         let now = Instant::now();
@@ -209,7 +247,7 @@ fn monitor_loop(
             text,
             scan: Some(format!("讀值：{}/{}", reading.current, reading.maximum)),
         });
-        sleep_interruptible(&stop, Duration::from_millis(80));
+        sleep_interruptible(&stop, Duration::from_millis(40));
     }
 }
 
@@ -319,6 +357,8 @@ fn tesseract(bmp: &[u8], psm: u8, tsv: bool) -> Result<String, String> {
     let whitelist = if tsv { "HPMP" } else { "0123456789/[]HP" };
     let psm_arg = psm.to_string();
     let mut command = Command::new("tesseract");
+    // Tesseract is a console program; keep its child process hidden in the GUI app.
+    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     command.args([
         "stdin",
         "stdout",
@@ -363,7 +403,7 @@ fn tesseract(bmp: &[u8], psm: u8, tsv: bool) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|e| e.to_string())
 }
 
-fn process_bmp(source: &[u8], thresholded: bool) -> Vec<u8> {
+fn process_bmp(source: &[u8], threshold: Option<u8>, scale: usize) -> Vec<u8> {
     if source.len() < 54 {
         return source.to_vec();
     }
@@ -378,7 +418,6 @@ fn process_bmp(source: &[u8], thresholded: bool) -> Vec<u8> {
     {
         return source.to_vec();
     }
-    let scale = 4usize;
     let out_width = width * scale;
     let out_height = height * scale;
     let data_len = out_width * out_height * 4;
@@ -415,8 +454,8 @@ fn process_bmp(source: &[u8], thresholded: bool) -> Vec<u8> {
     let resized = resize_lanczos3(&sharpened, width, height, scale);
     result.resize(54 + data_len, 0);
     for (index, gray) in resized.into_iter().enumerate() {
-        let value = if thresholded {
-            if gray >= 150.0 {
+        let value = if let Some(threshold) = threshold {
+            if gray >= threshold as f32 {
                 255
             } else {
                 0

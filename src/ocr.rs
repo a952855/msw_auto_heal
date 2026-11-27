@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reading {
     pub current: u32,
     pub maximum: u32,
@@ -70,12 +70,7 @@ pub struct HealDecision {
 }
 
 impl HealDecision {
-    pub fn evaluate(
-        &mut self,
-        reading: Reading,
-        threshold: f64,
-        now: Instant,
-    ) -> Decision {
+    pub fn evaluate(&mut self, reading: Reading, threshold: f64, now: Instant) -> Decision {
         if self.confirmed_max != Some(reading.maximum) {
             if self.pending_max == Some(reading.maximum) {
                 self.pending_count += 1;
@@ -83,8 +78,7 @@ impl HealDecision {
                 self.pending_max = Some(reading.maximum);
                 self.pending_count = 1;
             }
-            // Trust the first valid maximum immediately; require only one
-            // repeated read when an already established maximum changes.
+            // Use a second frame only when an already established maximum changes.
             let required = if self.confirmed_max.is_some() { 2 } else { 1 };
             if self.pending_count < required {
                 return Decision::Confirming;
