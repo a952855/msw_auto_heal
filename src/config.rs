@@ -8,6 +8,8 @@ use std::{
 #[serde(default)]
 pub struct Settings {
     pub window_prefix: String,
+    pub poll_interval_ms: u64,
+    pub failure_interval_ms: u64,
     pub profiles: Vec<Profile>,
     pub active_profile: usize,
 }
@@ -37,6 +39,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             window_prefix: "Maple".into(),
+            poll_interval_ms: 80,
+            failure_interval_ms: 120,
             profiles: vec![Profile::default()],
             active_profile: 0,
         }
@@ -105,6 +109,8 @@ pub fn load(path: &Path) -> io::Result<Settings> {
         // Ignore legacy `skills`; the Rust app intentionally has no skill loop.
         Ok(Settings {
             window_prefix,
+            poll_interval_ms: 80,
+            failure_interval_ms: 120,
             profiles: vec![Profile {
                 name: "預設".into(),
                 ocr,

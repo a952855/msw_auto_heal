@@ -23,6 +23,8 @@ const ID_PROFILE_NAME: i32 = 103;
 const ID_PROFILE_RENAME: i32 = 104;
 const ID_PROFILE_NEW: i32 = 105;
 const ID_PROFILE_DELETE: i32 = 106;
+const ID_POLL_INTERVAL: i32 = 107;
+const ID_FAILURE_INTERVAL: i32 = 108;
 const ID_HP_MAX: i32 = 150;
 const ID_HP_DAMAGE: i32 = 151;
 const ID_HP_SAFE: i32 = 152;
@@ -265,6 +267,11 @@ unsafe extern "system" fn wnd_proc(
                 ID_PROFILE_RENAME => rename_active_profile(app),
                 ID_PROFILE_NEW => add_profile(app),
                 ID_PROFILE_DELETE => delete_active_profile(app),
+                ID_POLL_INTERVAL | ID_FAILURE_INTERVAL => {
+                    if !app.loading_controls && !app.workers.iter().any(Option::is_some) {
+                        let _ = save_from_controls(app, false, false);
+                    }
+                }
                 ID_HP_MAX | ID_HP_DAMAGE => {
                     if !app.loading_controls {
                         update_hp_safety_threshold(app);
@@ -396,7 +403,7 @@ unsafe fn create_controls(app: &mut AppState) {
             WS_CHILD_VISIBLE | WS_BORDER | ES_AUTOHSCROLL as u32,
             140,
             14,
-            260,
+            210,
             25,
             ID_PREFIX,
         ),
@@ -419,11 +426,61 @@ unsafe fn create_controls(app: &mut AppState) {
             "BUTTON",
             "自動偵測 HP / MP 標籤位置",
             WS_CHILD_VISIBLE | (BS_AUTOCHECKBOX as u32) | WS_TABSTOP,
-            420,
+            360,
             14,
-            250,
+            220,
             26,
             ID_AUTO,
+        ),
+    );
+    control(
+        app.hwnd,
+        "STATIC",
+        "循環(ms)",
+        WS_CHILD_VISIBLE,
+        590,
+        18,
+        72,
+        20,
+        0,
+    );
+    app.controls.insert(
+        ID_POLL_INTERVAL,
+        control(
+            app.hwnd,
+            "EDIT",
+            "80",
+            WS_CHILD_VISIBLE | WS_BORDER | ES_AUTOHSCROLL as u32,
+            665,
+            14,
+            60,
+            25,
+            ID_POLL_INTERVAL,
+        ),
+    );
+    control(
+        app.hwnd,
+        "STATIC",
+        "失敗(ms)",
+        WS_CHILD_VISIBLE,
+        738,
+        18,
+        72,
+        20,
+        0,
+    );
+    app.controls.insert(
+        ID_FAILURE_INTERVAL,
+        control(
+            app.hwnd,
+            "EDIT",
+            "80",
+            WS_CHILD_VISIBLE | WS_BORDER | ES_AUTOHSCROLL as u32,
+            815,
+            14,
+            55,
+            25,
+            ID_FAILURE_INTERVAL,
         ),
     );
     app.controls.insert(
@@ -823,6 +880,11 @@ unsafe fn load_controls(app: &AppState) {
     );
     for (id, value) in [
         (ID_PREFIX, app.settings.window_prefix.clone()),
+        (ID_POLL_INTERVAL, app.settings.poll_interval_ms.to_string()),
+        (
+            ID_FAILURE_INTERVAL,
+            app.settings.failure_interval_ms.to_string(),
+        ),
         (ID_PROFILE_NAME, profile.name.clone()),
         (ID_HP_BASE, s.th_var.to_string()),
         (ID_HP_MAX, s.hp_max.to_string()),
@@ -849,6 +911,21 @@ unsafe fn save_from_controls(
     let active_profile = app.settings.active_profile;
     let mut s = app.settings.profiles[active_profile].ocr.clone();
     let window_prefix = get_text(app.controls[&ID_PREFIX]);
+    let poll_interval_ms = get_text(app.controls[&ID_POLL_INTERVAL]).parse::<u64>();
+    let failure_interval_ms = get_text(app.controls[&ID_FAILURE_INTERVAL]).parse::<u64>();
+    let (Ok(poll_interval_ms), Ok(failure_interval_ms)) = (poll_interval_ms, failure_interval_ms)
+    else {
+        if show {
+            set_error(app, "循環與失敗間隔必須是整數毫秒。");
+        }
+        return false;
+    };
+    if !(10..=5000).contains(&poll_interval_ms) || !(10..=5000).contains(&failure_interval_ms) {
+        if show {
+            set_error(app, "循環與失敗間隔需介於 10 到 5000 毫秒。");
+        }
+        return false;
+    }
     let hp_max = get_text(app.controls[&ID_HP_MAX]).parse::<i32>();
     let monster_max_damage = get_text(app.controls[&ID_HP_DAMAGE]).parse::<i32>();
     let (Ok(hp_max), Ok(monster_max_damage)) = (hp_max, monster_max_damage) else {
@@ -908,6 +985,8 @@ unsafe fn save_from_controls(
         }
     }
     app.settings.window_prefix = window_prefix;
+    app.settings.poll_interval_ms = poll_interval_ms;
+    app.settings.failure_interval_ms = failure_interval_ms;
     app.settings.profiles[active_profile].ocr = s;
     if !app.config_valid && !allow_invalid_replacement {
         return true;
@@ -986,6 +1065,8 @@ unsafe fn toggle_worker(app: &mut AppState, mana: bool) {
         mana,
         ocr.clone(),
         app.settings.window_prefix.clone(),
+        app.settings.poll_interval_ms,
+        app.settings.failure_interval_ms,
         app.tx.clone(),
     ));
     let status = if mana { ID_MP_STATUS } else { ID_HP_STATUS };
@@ -1023,6 +1104,8 @@ unsafe fn start_all(app: &mut AppState) {
             .ocr
             .clone(),
         app.settings.window_prefix.clone(),
+        app.settings.poll_interval_ms,
+        app.settings.failure_interval_ms,
         app.tx.clone(),
     ));
     app.workers[1] = Some(Worker::start(
@@ -1031,6 +1114,8 @@ unsafe fn start_all(app: &mut AppState) {
             .ocr
             .clone(),
         app.settings.window_prefix.clone(),
+        app.settings.poll_interval_ms,
+        app.settings.failure_interval_ms,
         app.tx.clone(),
     ));
     set_text(app.controls[&ID_HP_STATUS], "啟動中…");
@@ -1041,6 +1126,9 @@ unsafe fn start_all(app: &mut AppState) {
 unsafe fn update_worker_buttons(app: &AppState) {
     let hp_running = app.workers[0].is_some();
     let mp_running = app.workers[1].is_some();
+    let timing_enabled = !hp_running && !mp_running;
+    EnableWindow(app.controls[&ID_POLL_INTERVAL], timing_enabled as BOOL);
+    EnableWindow(app.controls[&ID_FAILURE_INTERVAL], timing_enabled as BOOL);
     set_text(
         app.controls[&ID_START_HP],
         if hp_running {

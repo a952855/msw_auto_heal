@@ -53,12 +53,23 @@ impl Worker {
         mana: bool,
         settings: OcrSettings,
         window_prefix: String,
+        poll_interval_ms: u64,
+        failure_interval_ms: u64,
         events: Sender<MonitorEvent>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
-        let join =
-            thread::spawn(move || monitor_loop(mana, settings, window_prefix, events, thread_stop));
+        let join = thread::spawn(move || {
+            monitor_loop(
+                mana,
+                settings,
+                window_prefix,
+                poll_interval_ms,
+                failure_interval_ms,
+                events,
+                thread_stop,
+            )
+        });
         Self {
             stop,
             join: Some(join),
@@ -81,6 +92,8 @@ fn monitor_loop(
     mana: bool,
     settings: OcrSettings,
     window_prefix: String,
+    poll_interval_ms: u64,
+    failure_interval_ms: u64,
     events: Sender<MonitorEvent>,
     stop: Arc<AtomicBool>,
 ) {
@@ -221,7 +234,7 @@ fn monitor_loop(
                 text: format!("{title} | 無法解析數值"),
                 scan: Some(raw),
             });
-            sleep_interruptible(&stop, Duration::from_millis(80));
+            sleep_interruptible(&stop, Duration::from_millis(failure_interval_ms));
             continue;
         };
         let now = Instant::now();
@@ -247,7 +260,7 @@ fn monitor_loop(
             text,
             scan: Some(format!("讀值：{}/{}", reading.current, reading.maximum)),
         });
-        sleep_interruptible(&stop, Duration::from_millis(40));
+        sleep_interruptible(&stop, Duration::from_millis(poll_interval_ms));
     }
 }
 
